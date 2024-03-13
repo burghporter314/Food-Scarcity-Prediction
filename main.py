@@ -4,12 +4,15 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from keras.layers import Dense, Dropout
+from keras.layers import Dense, Dropout, InputLayer
 from keras.models import Sequential
+from keras.optimizers import Adam
 from keras.regularizers import l1, l2
+from keras.callbacks import EarlyStopping
 from scipy import stats
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+from kerastuner import RandomSearch
 
 # Read in both datasets
 climate_change_df = pd.read_csv('./data/climate_change_data.csv')
@@ -40,26 +43,14 @@ df_no_outliers = numeric_cols[(np.abs(stats.zscore(numeric_cols)) < 3).all(axis=
 # Remove all rows that contained outliers
 cleaned_df = merged_df.loc[df_no_outliers.index]
 
-# This will agreggate the data to find the average hg/ha_yield off of country and year. We essentially remove the granularity of item yield
-average_yield_df = cleaned_df.groupby(['Country', 'Year']).agg({
-    'hg/ha_yield': 'mean',
-    'Temperature': 'mean',
-    'CO2 Emissions': 'mean',
-    'Sea Level Rise': 'mean',
-    'Precipitation': 'mean',
-    'Humidity': 'mean',
-    'Wind Speed': 'mean',
-    'average_rain_fall_mm_per_year': 'mean',
-    'pesticides_tonnes': 'mean',
-    'avg_temp': 'mean'
-}).reset_index()
-
 # One-hot encode country
-X = pd.get_dummies(average_yield_df, columns=['Country'])
+X = pd.get_dummies(cleaned_df, columns=['Country'])
+
+X = pd.get_dummies(X, columns=['Item'])
 
 # X is all the fields that predict hg/ha_yield
 X = X.drop('hg/ha_yield', axis=1)
-Y = average_yield_df['hg/ha_yield']
+Y = cleaned_df['hg/ha_yield']
 
 # Standardize the dataset to feed into the neural network
 scaler = StandardScaler()
@@ -67,22 +58,59 @@ X_scaled = scaler.fit_transform(X)
 
 X_train, X_test, Y_train, Y_test = train_test_split(X_scaled, Y, test_size=0.2)
 
-# Build a basic regression model (adjust hyperparams later)
+# Find the optimal hyperparameters for the problem
+# Found via deepnotes and chatgpt for supplementary usage
+def build_model(hp):
+    model = Sequential()
+    model.add(InputLayer(input_shape=(X_train.shape[1],)))
+
+    # Create a variable number of layers between 2 and 5 along with an associated Dropout layer
+    for i in range(hp.Int('num_layers', 2, 5)):
+        model.add(Dense(units=hp.Int('units_' + str(i), min_value=32, max_value=512, step=32),
+                        activation='relu'))
+        model.add(Dropout(rate=hp.Float('dropout_' + str(i), min_value=0.0, max_value=0.5, step=0.1)))
+
+    # Regression so just one unit needed
+    model.add(Dense(1))
+
+    # Adjust the learning rate dynamically, go off of val_loss for mean_squared_error
+    model.compile(optimizer=Adam(hp.Float('learning_rate', 1e-4, 1e-2, sampling='log')),
+                  loss='mean_squared_error')
+    return model
+
+# Find the optimal hyperparameters via keras tuner
+tuner = RandomSearch(
+    build_model,
+    objective='val_loss',
+    max_trials=160,
+    executions_per_trial=1
+)
+
+early_stopping = EarlyStopping(
+    monitor='val_loss',
+    patience=5,
+    restore_best_weights=True
+)
+
+tuner.search(X_train, Y_train, validation_split=0.2, epochs=20, batch_size=32)
+best_model = tuner.get_best_models(num_models=1)[0]
+
+# Best model based on keras tuner
 model = Sequential()
 
-model.add(Dense(64, activation='relu', input_shape=(X_train.shape[1],)))
+model.add(Dense(384, activation='relu', input_shape=(X_train.shape[1],)))
+
+model.add(Dense(448, activation='relu'))
+model.add(Dropout(0.1))
 
 model.add(Dense(32, activation='relu', kernel_regularizer=l1(0.1)))
-model.add(Dropout(0.5))
-
-model.add(Dense(32, activation='relu', kernel_regularizer=l1(0.1)))
-model.add(Dropout(0.5))
+model.add(Dropout(0.1))
 
 model.add(Dense(1))
 
 model.compile(optimizer='adam', loss='mean_squared_error')
 
-history = model.fit(X_train, Y_train, validation_split=0.2, epochs=1500, batch_size=16)
+history = model.fit(X_train, Y_train, validation_split=0.2, epochs=100, batch_size=32)
 
 plt.plot(history.history['loss'], label='Training Loss')
 plt.plot(history.history['val_loss'], label='Validation Loss')
